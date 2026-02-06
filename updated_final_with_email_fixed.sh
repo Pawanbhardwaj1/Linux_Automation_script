@@ -1,0 +1,1181 @@
+#!/bin/bash
+# Description: A menu-driven automation for Linux server patching and cloud build operations.
+
+# --- Global Variables ---
+LOG_DIR="/tmp/automation/logs"
+Compare_output_file=""
+LOG_FILE=""
+PRECHECK_FILE=""
+POSTCHECK_FILE=""
+SERVER_LIST="" # Initialize global server list variable
+CR_NUMBER="" 
+POLL_INTERVAL=10
+POLL_TIMEOUT=800
+RECIPIENT_EMAIL="your.email@example.com"
+SCRIPT_USER="${USER:-$(whoami)}"
+
+# --- Function Definitions ---
+# Function to log messages with a timestamp and status
+log_message() {
+  local status="$1"
+  local message="$2"
+  # Add user info for auditing
+  echo "[$(date +'%Y-%m-%d %H:%M:%S')]-[$(whoami)]-[$CR_NUMBER]-$status-$message" | tee -a "$LOG_FILE"
+}
+
+# Function to send email reports
+send_email() {
+    # $1 is the descriptive stage message (e.g., "Pre-Checks Completed")
+    local stage_message="$1" 
+    local attach_log="$2"  # "yes" or "no"
+    
+    # The subject now uses the descriptive message directly
+    local subject="Patching Report: $stage_message | CR: $CR_NUMBER"
+    
+    local body="This is an automated notification from the patching script.
+
+Execution Stage: $stage_message
+CR Number: ${CR_NUMBER:-N/A}
+Server List: ${SERVER_LIST:-N/A}
+Timestamp: $(date)
+
+Please review the attached log file ($LOG_FILE) for full details."
+
+    log_message "Attempting to send email for stage: $stage_message to $RECIPIENT_EMAIL"
+
+    if [[ "$attach_log" == "yes" ]]; then
+        # Email with attachment
+        echo "$body" | mail -s "$subject" -a "$LOG_FILE" "$RECIPIENT_EMAIL"
+    else
+        # Email without attachment
+        echo "$body" | mail -s "$subject" "$RECIPIENT_EMAIL"
+    fi
+
+    if [[ $? -eq 0 ]]; then
+        log_message "✅ Email sent successfully for stage: $stage_message."
+    else
+        log_message "❌ FAILED to send email for stage: $stage_message. Check 'mail' utility configuration."
+        echo "🚨 WARNING: FAILED TO SEND EMAIL for $stage_message. Check your system's mail setup."
+    fi
+}
+
+# Function to handle Ctrl+C (SIGINT) or termination (SIGTERM)
+ctrl_c_handler() {
+    # Log the forced stop
+    log_message "🚨 Script forcefully interrupted by user: $SCRIPT_USER (Ctrl+C / SIGINT)."
+    
+    # Send the emergency email (5th email trigger)
+    # The stage name is customized to include the user for clarity
+    send_email "Automation Forced Stop by user -- $SCRIPT_USER" "yes"
+
+    log_message "Script terminated by user interrupt. Exiting with status 130."
+    
+    # Exit with a status code indicating a fatal error/interruption (128 + signal number)
+    exit 130 
+}
+# --- TRAP Command for Interruption Handling ---
+# Instructs the shell to run the 'ctrl_c_handler' function when it receives 
+# the SIGINT (Ctrl+C) or SIGTERM (standard termination) signal.
+trap 'ctrl_c_handler' INT TERM
+
+# Function to initialize logging directories and files
+initialize_logging() {
+    # Define the desired permissions for the log directory
+    local LOG_PERMISSIONS="777"
+    
+    # Check if the log directory exists
+    if [ ! -d "$LOG_DIR" ]; then
+       
+        if ! sudo mkdir -p -m "$LOG_PERMISSIONS" "$LOG_DIR"; then
+            echo "❌ Error: Failed to create log directory '$LOG_DIR' with permissions $LOG_PERMISSIONS. Exiting."
+            exit 1
+        else
+            echo "✅ Created log directory '$LOG_DIR' with permissions $LOG_PERMISSIONS."
+        fi
+    else
+        # If the directory already exists, ensure it has the desired permissions
+        if ! sudo chmod "$LOG_PERMISSIONS" "$LOG_DIR"; then
+            echo "⚠️ Warning: Failed to set log directory permissions to $LOG_PERMISSIONS for '$LOG_DIR'."
+        else
+            echo "✅ Log directory '$LOG_DIR' verified and permissions set to $LOG_PERMISSIONS."
+        fi
+    fi
+    
+    # Set the full paths for the log files
+    # The date format is simplified for readability in file names.
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    
+    LOG_FILE="$LOG_DIR/automation_script-$timestamp.log"
+    PRECHECK_FILE="$LOG_DIR/precheck_report-$timestamp.log"
+    POSTCHECK_FILE="$LOG_DIR/postcheck_report-$timestamp.log"
+    Compare_output_file="$LOG_DIR/result_comparison-$timestamp.log"
+
+    # Note: 'log_message' is assumed to be defined elsewhere, but using 'echo' here 
+    # for initialization status before the main log file is fully functional.
+    echo "---"
+    echo "✅ Logging initialized. All logs will be stored in '$LOG_DIR'."
+	send_email " Automation Execution Start by User -- $(whoami)" "no"
+}
+
+# Function to prompt the user for a Change Request (CR) number before patching
+prompt_for_change_request() {
+    log_message "--- Starting Change Management Check ---"
+    read -r -p "🚨 ENTER CHANGE REQUEST (CR) NUMBER: " input_cr
+    
+    if [[ -z "$input_cr" ]]; then
+        log_message "❌ CR Number not entered. Patching cannot proceed without a CR."
+        echo "❌ CR Number is mandatory. Please enter a valid CR to continue the patching process."
+        CR_NUMBER="" # Ensure it is empty if user cancels
+        return 1 # Indicate failure
+    fi
+    
+    CR_NUMBER="$input_cr"
+    log_message "✅ Change Request Number set: $CR_NUMBER"
+    echo "Change Request Number '$CR_NUMBER' recorded. All patching logs will be associated with this CR."
+    return 0 # Indicate success
+}
+# Function to get the OS version of a remote server (e.g., 8.9, 22.04)
+get_remote_os_version() {
+    local server="$1"
+    local os_id=$(get_remote_os "$server") # Uses existing get_remote_os
+    local version_info
+
+    case "$os_id" in
+        RHEL)
+            # Get major.minor version (e.g., 8.9) from /etc/redhat-release
+            version_info=$(ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no "$server" "grep -oE '[0-9]+\.[0-9]+' /etc/redhat-release | head -1" 2>/dev/null)
+            ;;
+        SUSE)
+            # Get major version (e.g., 15) from SLES
+            version_info=$(ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no "$server" "grep -oE '[0-9]+' /etc/os-release | head -1" 2>/dev/null)
+            ;;
+        UBUNTU)
+            # Get major version (e.g., 22.04) from lsb_release
+            version_info=$(ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no "$server" "lsb_release -rs" 2>/dev/null)
+            ;;
+        *)
+            version_info="unknown"
+            ;;
+    esac
+    echo "$version_info"
+}
+
+# Function to check the OS version against a simplified End-of-Life (EOL) map
+check_os_version_and_eol() {
+    log_message "--- Starting OS Version and EOL Check ---"
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+    
+    echo "=========================================="
+    echo "   OS Version / EOL Status Report"
+    echo "=========================================="
+
+    for server in $SERVER_LIST; do
+        local os_id=$(get_remote_os "$server")
+        local os_version
+        local major_version
+        
+        os_version=$(get_remote_os_version "$server")
+        
+        log_message "Checking EOL for $server ($os_id $os_version)..."
+        
+        local eol_status="✅ SUPPORTED"
+        local eol_note="Supported by vendor (or current LTS)."
+
+        case "$os_id" in
+            RHEL)
+                # Check for RHEL major version less than 8
+                major_version=$(echo "$os_version" | cut -d'.' -f1)
+                if [[ "$major_version" -lt 8 ]]; then
+                    eol_status="⚠️ WARNING: MAJOR VERSION EOL"
+                    eol_note="RHEL $major_version is likely past or nearing EOL (e.g., RHEL 7 EOL: Jun 2024). Consider upgrading."
+                fi
+                ;;
+            SUSE)
+                # Check for SLES major version less than 15
+                major_version=$(echo "$os_version" | cut -d'.' -f1)
+                if [[ "$major_version" -lt 15 ]]; then
+                    eol_status="⚠️ WARNING: MAJOR VERSION EOL"
+                    eol_note="SLES $major_version is likely past or nearing EOL (e.g., SLES 12 EOL: Oct 2024). Consider upgrading."
+                fi
+                ;;
+            UBUNTU)
+                # Check for Ubuntu LTS version less than 22.04
+                major_version=$(echo "$os_version" | cut -d'.' -f1)
+                if [[ "$major_version" -lt 22 ]]; then
+                    eol_status="⚠️ WARNING: MAJOR VERSION EOL"
+                    eol_note="Ubuntu $os_version (e.g., 20.04) is past or nearing standard LTS EOL. Review support contract."
+                fi
+                ;;
+            unknown)
+                eol_status="❓ UNKNOWN OS"
+                eol_note="Could not determine OS to check EOL status."
+                ;;
+        esac
+        
+        echo "Server: $server (OS: $os_id $os_version)" | tee -a "$LOG_FILE"
+        echo "Status: $eol_status" | tee -a "$LOG_FILE"
+        echo "Note:   $eol_note" | tee -a "$LOG_FILE"
+        echo "------------------------------------------"
+        log_message "$server EOL Check: $eol_status. Note: $eol_note"
+    done
+    
+    log_message "--- OS Version and EOL Check complete. ---"
+}
+
+# Function to run checks on servers and save to a specified file
+run_checks() {
+    local output_file="$1"
+    local action_name="$2"
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+	
+    log_message "--- Starting $action_name ---"
+    echo "--- $action_name started on $(date) ---" >>"$output_file"
+    for server in $SERVER_LIST; do
+        log_message "Running checks on $server..."
+        echo "==========================================" >>"$output_file"
+        echo "Hostname: $server" >>"$output_file"
+        echo "Timestamp: $(date)" >>"$output_file"
+        echo "==========================================" >>"$output_file"
+
+        # List of commands to run
+        local commands=(
+            "uptime"
+            "df -h"
+            "uname -a"
+            "cat /etc/fstab"
+            "cat /etc/resolv.conf"
+            "free -h"
+            "lsblk"
+        )
+        for cmd in "${commands[@]}"; do
+            echo "------------ $cmd on $server ------------" >>"$output_file"
+            ssh "$server" "$cmd" 2>&1 | tee -a "$LOG_FILE" >>"$output_file"
+			echo "----------------------------------------" >>"$output_file"
+            echo "" >>"$output_file" # Add a newline for spacing
+        done
+    done
+    
+    # --- NEW: Automated OS Version and EOL Check (Pre-Patch Warning) ---
+    if [[ "$action_name" == *"Pre-Patching Checks"* ]]; then
+        log_message "--- Starting OS Version and EOL Check (Pre-Patch Warning) ---"
+        echo "=================================================" >>"$output_file"
+        echo "  OS EOL WARNING (Risk Assessment - Pre-Patch)" >>"$output_file"
+        echo "=================================================" >>"$output_file"
+        
+        # This function runs the EOL check logic and logs the output
+        check_os_version_and_eol | tee -a "$output_file"
+        
+        log_message "--- Automated OS Version and EOL Check complete. ---"
+    fi
+
+    log_message "--- $action_name complete. Results saved to $output_file ---"
+    echo "The $action_name report has been saved to $output_file."
+}
+
+
+# Function to compare pre-check and post-check files and highlight changes
+compare_reports() {
+    log_message "--- Comparing pre-check and post-check reports ---"
+    if [ ! -f "$PRECHECK_FILE" ] || [ ! -f "$POSTCHECK_FILE" ]; then
+        log_message "Pre-check or post-check file is missing. Cannot compare."
+        echo "Pre-check or post-check report is missing. Please run the checks first."
+        return
+    fi
+
+    # Create temporary files to store filtered content
+    local temp_pre="/tmp/precheck_filtered-$(date +%s).log"
+    local temp_post="/tmp/postcheck_filtered-$(date +%s).log"
+
+    # Filter out timestamps, uptime, and other dynamic content
+    # This also removes the first few header lines
+    grep -Ev 'Timestamp:|uptime|uname -a|automation_script-|result_comparison-|precheck_report-|postcheck_report-' "$PRECHECK_FILE" > "$temp_pre"
+    grep -Ev 'Timestamp:|uptime|uname -a|automation_script-|result_comparison-|precheck_report-|postcheck_report-' "$POSTCHECK_FILE" > "$temp_post"
+
+    echo "Differences between pre-check and post-check reports:" | tee -a "$LOG_FILE" "$Compare_output_file"
+    echo "-----------------------------------------------------" | tee -a "$LOG_FILE" "$Compare_output_file"
+
+    local diff_output
+    diff_output=$(diff -u --label="Pre-Check" "$temp_pre" --label="Post-Check" "$temp_post")
+
+    if [[ -z "$diff_output" ]]; then
+        log_message "✅ No significant changes detected between pre-check and post-check reports (excluding uname -a, timestamps and uptime)."
+        echo "✅ No significant changes detected." | tee -a "$LOG_FILE" "$Compare_output_file"
+    else
+        log_message "⚠️ Found changes between reports. See details below."
+        
+        # Parse and highlight changes from the unified diff output
+        echo "$diff_output" | while read -r line; do
+            if [[ "$line" =~ ^--- ]] || [[ "$line" =~ ^\+\+\+ ]] || [[ "$line" =~ ^@@ ]]; then
+                # Skip diff header lines
+                continue
+            elif [[ "$line" =~ ^- ]]; then
+                echo "❌ Removed line: ${line:1}" | tee -a "$LOG_FILE" "$Compare_output_file"
+            elif [[ "$line" =~ ^\+ ]]; then
+                echo "✅ Added line: ${line:1}" | tee -a "$LOG_FILE" "$Compare_output_file"
+            else
+                # Print context lines
+                echo "$line" | tee -a "$LOG_FILE" "$Compare_output_file"
+            fi
+        done
+    fi
+
+    echo "-----------------------------------------------------" | tee -a "$LOG_FILE" "$Compare_output_file"
+    log_message "--- Comparison complete. ---"
+    echo "The comparison results have been saved to the main log file and compare_output_file."
+    
+    # Clean up temporary files
+    rm -f "$temp_pre" "$temp_post"
+}
+
+# Function to get server list from user
+get_server_list() {
+    echo "Enter server hostnames (one per line). Press Ctrl+D when you're done:"
+    # This reads all lines from standard input until EOF (Ctrl+D)
+    SERVER_LIST=$(cat)
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "No servers entered."
+    else
+        log_message "Server list updated."
+    fi
+}
+
+# Function to check server uptime
+check_uptime() {
+    log_message "--- Checking Connectivity of servers by checking Uptime ---"
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+    for server in $SERVER_LIST; do
+        log_message "Checking uptime for $server..."
+        ssh "$server" "uptime" 2>&1 | tee -a "$LOG_FILE"
+        if [[ $? -ne 0 ]]; then
+            log_message "Error connecting to $server. Skipping."
+        fi
+    done
+    log_message "--- Uptime check completed. ---"
+}
+
+# Function to check filesystem utilization
+check_filesystem_utilization() {
+    log_message "--- Checking Filesystem Utilization for Servers ---"
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+    for server in $SERVER_LIST; do
+        log_message "Checking filesystem utilization for $server..."
+        ssh "$server" "df -h" 2>&1 | tee -a "$LOG_FILE"
+        if [[ $? -ne 0 ]]; then
+            log_message "Error connecting to $server. Skipping."
+        fi
+    done
+    log_message "--- Filesystem utilization check complete. ---"
+}
+
+# --- NEW Function for a simple progress bar ---
+show_progress() {
+    local duration=$1
+    local current_time=$2
+    local total_time=$3
+
+    # FIX: Check for total_time <= 0 to prevent division by zero and logical errors.
+    if [[ "$total_time" -le 0 ]]; then
+        # Print a simple message and return early to avoid the error.
+        printf "\r[--------------------] 0%% Elapsed: %d/%d sec (Error: Invalid total time)" "$duration" "$total_time"
+        return
+    fi
+    
+    # Calculate percentage (using integer arithmetic)
+    local percentage=$(( (current_time * 100) / total_time ))
+    
+    # Ensure percentage doesn't exceed 100 (in case of floating point inaccuracies or forcing 100%)
+    if [[ "$percentage" -gt 100 ]]; then
+        percentage=100
+    fi
+    
+    # Calculate bar segments (20 characters total length)
+    local bar_length=20
+    local filled=$(( (percentage * bar_length) / 100 ))
+    local empty=$(( bar_length - filled ))
+    
+    local bar=""
+    
+    # Construct the filled part (using '#' characters)
+    bar=$(printf "%${filled}s" | tr ' ' '#')
+    
+    # Construct the empty part (using '-' characters)
+    bar+=$(printf "%${empty}s" | tr ' ' '-')
+    
+    # Use '\r' (carriage return) to overwrite the current line for the animation effect
+    printf "\r[%s] %3d%% Elapsed: %d/%d sec" "$bar" "$percentage" "$duration" "$total_time"
+}
+
+reboot_servers() {
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+    log_message "--- Starting server reboot process ---"
+    for server in $SERVER_LIST; do
+        log_message "Rebooting server: $server"
+        ssh "$server" "sudo reboot" 2>&1 | tee -a "$LOG_FILE"
+        if [[ $? -ne 0 ]]; then
+            log_message "❌ Error: Could not initiate reboot on $server."
+            continue # Move to the next server if reboot fails
+        else
+            log_message "✅ Reboot command sent to $server. Waiting for server to come back up..."
+            
+            local start_time=$(date +%s)
+            local current_time
+            local elapsed_time
+            local timeout=$POLL_TIMEOUT
+            
+            while true; do
+                current_time=$(date +%s)
+                elapsed_time=$(( current_time - start_time ))
+                
+                # Update and display the progress bar
+                show_progress "$elapsed_time" "$elapsed_time" "$timeout"
+                
+                if (( elapsed_time > timeout )); then
+                    printf "\n"
+                    log_message "❌ Timeout: Server $server did not respond after $timeout seconds. Skipping..."
+                    break
+                fi
+                
+                # Try to connect and run uptime
+                if ssh "$server" "uptime" &>/dev/null; then
+                    # Add this line to show 100% progress before breaking the loop
+                    show_progress "$elapsed_time" "$elapsed_time" "$elapsed_time"
+                    printf "\n" # Move to a new line after the progress bar
+                    log_message "✅ Server $server is back online."
+                    log_message "Uptime output for $server:"
+                    ssh "$server" "uptime" | tee -a "$LOG_FILE"
+                    break
+                else
+                    sleep "$POLL_INTERVAL"
+                fi
+            done
+        fi
+    done
+    log_message "--- Server reboot process complete. ---"
+}
+
+# Function to check the OS of a remote server via SSH
+get_remote_os() {
+    local server="$1"
+    local os_info
+    os_info=$(ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no "$server" '
+        if [ -f /etc/redhat-release ]; then
+            echo "RHEL"
+        elif [ -f /etc/SuSE-release ] || grep -q "SUSE" /etc/os-release; then
+            echo "SUSE"
+        elif [ -f /etc/lsb-release ] || [ -f /etc/debian_version ]; then
+            echo "UBUNTU"
+        else
+            echo "unknown"
+        fi
+    ' 2>/dev/null)
+    echo "$os_info"
+}
+
+# Function to perform OS-specific patching
+patch_servers() {
+    local patch_os="$1"
+    local patch_command="$2"
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+	echo ""
+	log_message "--- Checking OS EOL  ---"
+    # Run EOL check and capture output (for warnings)
+    check_os_version_and_eol 
+	echo ""
+    log_message "--- OS EOL Checks Done........Proceeding with patching... ---"
+	echo ""
+	echo ""
+	echo "=========================================="
+    echo "   Starting $patch_os patching   "
+    echo "=========================================="
+    for server in $SERVER_LIST; do
+        local remote_os
+        remote_os=$(get_remote_os "$server")
+        if [[ "$remote_os" == "$patch_os" ]]; then
+		echo ""
+		    echo "==============================================="
+            log_message "✅ Patching $remote_os server: $server"
+			echo "==============================================="
+			echo ""
+            ssh "$server" "sudo $patch_command" 2>&1 | tee -a "$LOG_FILE"
+            if [[ $? -ne 0 ]]; then
+                log_message "Error or failure during patching on $server."
+            fi
+        else
+            log_message "Skipped. You have selected $patch_os patching, but $server current OS is $remote_os. Please choose $remote_os server patching option."
+        fi
+    done
+    log_message "--- $patch_os patching complete. ---"
+}
+# Function to check for available updates based on OS
+check_updates_by_os() {
+    log_message "--- Starting OS-aware Update Check for Servers ---"
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+
+    for server in $SERVER_LIST; do
+        local remote_os
+        # The existing get_remote_os function is used to determine the OS
+        remote_os=$(get_remote_os "$server")
+        local check_command
+
+        log_message "Checking available updates on $server (OS: $remote_os)..."
+        echo "Updates for $server (OS: $remote_os):"
+
+        case "$remote_os" in
+            RHEL)
+                # Check for RHEL/CentOS updates using yum or dnf
+                check_command="sudo yum check-update -y || sudo dnf check-update -y"
+                ;;
+            SUSE)
+                # Check for SUSE/SLES updates
+                check_command="sudo zypper list-updates"
+                ;;
+            UBUNTU)
+                # Refresh local package index, then list upgradable packages
+                check_command="sudo apt update > /dev/null 2>&1 && apt list --upgradable"
+                ;;
+            *)
+                log_message "Skipped $server: Unknown OS ($remote_os). Cannot check updates."
+                echo "Skipped $server: Unknown OS ($remote_os). Cannot check updates." | tee -a "$LOG_FILE"
+                continue
+                ;;
+        esac
+
+        # Execute the check command
+        echo "--- Running command: $check_command ---" | tee -a "$LOG_FILE"
+        ssh "$server" "$check_command" 2>&1 | tee -a "$LOG_FILE"
+        if [[ $? -eq 0 ]]; then
+            log_message "✅ Update check successful on $server."
+        else
+            log_message "⚠️ Note: Update check on $server returned a non-zero exit code. Check the detailed output above."
+        fi
+    done
+    log_message "--- Update Check completed. ---"
+}
+# === NEW FUNCTION: Update Repositories by OS ===
+update_repos_by_os() {
+    log_message "--- Starting Repository Update (OS Auto-Detect) ---"
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+
+    for server in $SERVER_LIST; do
+        local remote_os
+        remote_os=$(get_remote_os "$server")
+        local update_command
+
+        case "$remote_os" in
+            RHEL)
+                # Refresh repository metadata for RHEL/CentOS
+                update_command="sudo yum clean all && sudo yum repolist"
+                ;;
+            SUSE)
+                # Refresh repository metadata for SUSE/SLES
+                update_command="sudo zypper refresh"
+                ;;
+            UBUNTU)
+                # Refresh package list for Ubuntu/Debian
+                update_command="sudo apt update"
+                ;;
+            *)
+                log_message "Skipped $server: Unknown OS ($remote_os). Cannot update repositories."
+                echo "Skipped $server: Unknown OS. Cannot update repositories."
+                continue
+                ;;
+        esac
+
+        log_message "Running '$remote_os' repo update on $server using command: $update_command"
+        echo "=========================================="
+        echo "Repo update for $server ($remote_os):"
+        echo "=========================================="
+        ssh "$server" "$update_command" 2>&1 | tee -a "$LOG_FILE"
+        if [[ $? -ne 0 ]]; then
+            log_message "❌ Error: Repository update failed on $server."
+            echo "❌ Repository update failed on $server. Check log file."
+        else
+            log_message "✅ Repository update successful on $server."
+            echo "✅ Repository update successful on $server."
+        fi
+    done
+    log_message "--- Repository Update completed. ---"
+}
+# Function to mount filesystems defined in /etc/fstab that are not mounted
+mount_missing_filesystems() {
+    log_message "--- Starting Mount Missing Filesystems (mount -a) ---"
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+
+    for server in $SERVER_LIST; do
+        log_message "Attempting to mount all filesystems on $server defined in /etc/fstab..."
+        echo "=========================================="
+        echo "Mount missing filesystems on $server:"
+        echo "=========================================="
+        
+        # The 'mount -a' command attempts to mount all filesystems listed in /etc/fstab
+        # that are not already mounted (and are not explicitly excluded, e.g., by 'noauto').
+        local mount_output
+        mount_output=$(ssh "$server" "sudo mount -a" 2>&1)
+        
+        if [[ $? -eq 0 ]]; then
+            log_message "✅ Filesystem mounting successful on $server (mount -a returned 0)."
+            echo "✅ Filesystem mounting successful on $server. Checking current mounts (df -h):" | tee -a "$LOG_FILE"
+            ssh "$server" "df -h" 2>&1 | tee -a "$LOG_FILE"
+        else
+            log_message "⚠️ Note: mount -a failed on $server. Output: $mount_output"
+            echo "❌ Filesystem mounting failed on $server. The server may still be usable, but check the fstab configuration." | tee -a "$LOG_FILE"
+            echo "$mount_output" | tee -a "$LOG_FILE"
+        fi
+    done
+    log_message "--- Mount Missing Filesystems completed. ---"
+}
+
+# Function to execute an arbitrary command on all listed servers
+run_adhoc_command() {
+    log_message "--- Starting Ad-hoc Command Execution ---"
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+
+    # Prompt the user for the command
+    read -r -p "Enter the ad-hoc command to run on all servers (e.g., 'cat /proc/cpuinfo' or 'sudo systemctl status httpd'): " adhoc_command
+    if [[ -z "$adhoc_command" ]]; then
+        log_message "No command entered. Ad-hoc execution aborted."
+        echo "No command entered. Ad-hoc execution aborted."
+        return
+    fi
+    
+    log_message "Executing ad-hoc command: '$adhoc_command' on all servers."
+    echo "=========================================="
+    echo "Running command: $adhoc_command"
+    echo "=========================================="
+
+    for server in $SERVER_LIST; do
+        log_message "Executing on $server..."
+		echo ""
+        echo "--- Output from $server ---" | tee -a "$LOG_FILE"
+        echo ""
+        # Execute the command via SSH. Output is piped to the log file and the console.
+        ssh "$server" "$adhoc_command" 2>&1 | tee -a "$LOG_FILE"
+        
+        if [[ $? -ne 0 ]]; then
+            log_message "❌ Command execution failed on $server."
+        else
+            log_message "✅ Command execution successful on $server."
+        fi
+        echo "--------------------------" | tee -a "$LOG_FILE"
+    done
+
+    log_message "--- Ad-hoc Command Execution completed. ---"
+}
+
+# Function to check patching completion status by auto-detecting OS and checking relevant logs
+check_patching_status() {
+    log_message "--- Starting OS-aware Patching Status Check ---"
+    if [[ -z "$SERVER_LIST" ]]; then
+        log_message "Server list is empty. Please enter servers first."
+        return
+    fi
+
+    for server in $SERVER_LIST; do
+        local remote_os
+        remote_os=$(get_remote_os "$server")
+        local log_command=""
+        local success_message=""
+        local check_failed=false
+
+        log_message "Checking patching status on $server (OS: $remote_os)..."
+        echo "=========================================="
+        echo "Patching Status for $server (OS: $remote_os):"
+        echo "=========================================="
+
+        case "$remote_os" in
+            RHEL)
+                # Check for RHEL/CentOS logs (dnf and yum)
+                log_command="sudo grep -iE 'completed|updated:|upgraded:' /var/log/dnf.log /var/log/yum.log | tail -n 5"
+                success_message="SUCCESS: Found recent 'completed' or 'updated' messages in DNF/YUM logs."
+                ;;
+            SUSE)
+                # Check for SUSE logs (zypper)
+                log_command="sudo grep -iE 'installed|committed' /var/log/zypp/history | tail -n 5"
+                success_message="SUCCESS: Found recent 'installed' or 'committed' messages in ZYPP history."
+                ;;
+            UBUNTU)
+                # Check for Ubuntu logs (apt)
+                log_command="sudo grep -iE 'Commandline: apt(-get)? (install|upgrade|dist-upgrade)|status installed' /var/log/apt/history.log | tail -n 5"
+                success_message="SUCCESS: Found recent 'upgrade' commands or 'installed' status in APT history."
+                ;;
+            *)
+                log_message "Skipped $server: Unknown OS ($remote_os). Cannot check logs."
+                echo "Skipped $server: Unknown OS ($remote_os). Cannot check logs." | tee -a "$LOG_FILE"
+                continue
+                ;;
+        esac
+
+        # Execute the check command
+        local log_output
+        log_output=$(ssh "$server" "$log_command" 2>&1)
+        local ssh_exit_code=$?
+        
+        # Check for success indicators
+        if [[ "$ssh_exit_code" -eq 0 && -n "$log_output" ]]; then
+            log_message "✅ $server: $success_message"
+            echo "$log_output" | tee -a "$LOG_FILE"
+        else
+            log_message "❌ $server: FAILURE. Could not find recent patching success indicators or command failed."
+            echo "❌ FAILURE: No clear patching completion confirmation found in logs on $server." | tee -a "$LOG_FILE"
+            if [[ -n "$log_output" ]]; then
+                 echo "Last 5 lines of related logs (even if command failed):" | tee -a "$LOG_FILE"
+                 echo "$log_output" | tee -a "$LOG_FILE"
+            fi
+        fi
+        echo "----------------------------------------"
+    done
+    log_message "--- Patching Status Check completed. ---"
+}
+
+# Function to check for Azure Resource Group existence
+check_rg_exists() {
+    az group show --name "$1" &>/dev/null
+}
+
+# Function to check if a VNet and Subnet exist in Azure
+check_vnet_subnet_exists() {
+    local rg_name="$1"
+    local vnet_name="$2"
+    local subnet_name="$3"
+    az network vnet subnet show --resource-group "$rg_name" --vnet-name "$vnet_name" --name "$subnet_name" &>/dev/null
+}
+
+# Function to check if an AWS VPC and Subnet exist
+check_aws_vpc_subnet_exists() {
+    local vpc_id="$1"
+    local subnet_id="$2"
+    aws ec2 describe-vpcs --vpc-ids "$vpc_id" &>/dev/null && aws ec2 describe-subnets --subnet-ids "$subnet_id" &>/dev/null
+}
+
+# Common function to handle cluster commands on a single server
+run_cluster_command() {
+    local server="$1"
+    local command_name="$2"
+    local command="$3"
+    log_message "Running '$command_name' on $server..."
+    ssh "$server" "sudo $command" 2>&1 | tee -a "$LOG_FILE"
+    if [ $? -eq 0 ]; then
+        log_message "Command '$command_name' executed successfully on $server."
+    else
+        log_message "Error executing '$command_name' on $server. Check logs for details."
+    fi
+}
+
+# Cluster command menus
+suse_cluster() {
+    while true; do
+        clear
+        echo "======================================================="
+        echo "   SUSE Cluster Menu"
+        echo "======================================================="
+        echo "---------------------------------------"
+        echo " 1.➡️ Enter Server List"
+		echo " 2.➡️ Enter CR Number"
+        echo " 3.➡️ Check SUSE Cluster Status"
+        echo " 4.➡️ Move SUSE Cluster resources"
+        echo " 5.➡️ Perform Resource Cleanup"
+        echo " 6.➡️ Clear Location Constraints"
+        echo " 7.➡️ Return to Previous Menu"
+		echo " 8.➡️ Return to Main Menu"
+		echo " 9.➡️ Exit"
+        echo "---------------------------------------"
+        echo ""
+		echo ""
+        if [ -n "$SERVER_LIST" ]; then
+            echo "Please validate the below provided servers: if not sure, Please use option 1."
+            echo "$SERVER_LIST"
+        else
+            echo ""
+            echo "🚨 WARNING 🚨: No servers found. Don't worry ...Please use option 1."
+            echo ""
+        fi
+        echo ""
+		echo ""
+        read -p "Enter your choice: " choice
+		echo ""
+		echo ""
+        case $choice in
+        1) get_server_list ;;
+		2) prompt_for_change_request ;;
+         # --- CR NUMBER ENFORCEMENT STARTS HERE ---
+        3|4|5|6) 
+            if [[ -z "$CR_NUMBER" ]]; then
+                log_message "❌ ABORTED: Operation $choice requested, but CR Number is missing."
+                echo "🚨 MANDATORY: You must enter a Change Request (CR) number using Option 2 before proceeding with any operation."
+            else
+                # If CR_NUMBER is set, proceed to the secondary case block for the actual operation
+                case $choice in
+                    3) 
+                        for server in $SERVER_LIST; do run_cluster_command "$server" "crm status" "crm status"; done 
+                        ;;
+                    4) 
+                        read -p "Enter the name of the resource to move: " resource_name
+                        read -p "Enter the destination node name: " node_name
+                        for server in $SERVER_LIST; do run_cluster_command "$server" "crm resource move" "crm resource move $resource_name $node_name"; done
+                        ;;
+                    5) 
+                        read -p "Enter the name of the resource to cleanup: " resource_name
+                        for server in $SERVER_LIST; do run_cluster_command "$server" "crm resource cleanup" "crm resource cleanup $resource_name"; done
+                        ;;
+                    6) 
+                        read -p "Enter the name of the resource to clear constraints: " resource_name
+                        for server in $SERVER_LIST; do run_cluster_command "$server" "crm resource clear" "crm resource clear $resource_name"; done
+                        ;;
+                esac
+            fi
+            ;;
+        7) log_message "Going back to Previous Menu... please wait✋." return ;;
+        8 ) log_message "Going back to Main Menu... please wait✋." return 2 ;;
+        9 ) log_message "Exiting script. Have a Great Day !!! Goodbye! 👋😀" exit 0 ;;
+        *) echo "Oops Invalid option selected ❌. Please enter a number from 1 to 9." ;;
+        esac
+        echo 
+        read -p "Press Enter to continue..."
+    done
+}
+
+rhel_cluster() {
+    while true; do
+        clear
+        echo "========================================"
+        echo " Preparing Menu ....Please wait ✋...."
+        echo "========================================="
+        sleep 2
+        clear
+        echo "======================================================="
+        echo " RHEL Cluster Menu"
+        echo "======================================================="
+        echo "---------------------------------------"
+        echo " 1.➡️ Enter Server List"
+        echo " 2.➡️ Enter CR Number"
+        echo " 3.➡️ Check RHEL Cluster Status"
+        echo " 4.➡️ Move RHEL Cluster resources"
+        echo " 5.➡️ Perform Resource Cleanup"
+        echo " 6.➡️ Clear Location Constraints"
+        echo " 7.➡️ Return to Previous Menu"
+        echo " 8.➡️ Return to Main Menu"
+        echo " 9.➡️ Exit"
+        echo "---------------------------------------"
+        echo ""
+        echo ""
+        if [ -n "$SERVER_LIST" ]; then
+            echo "Please validate the below provided servers: if not sure, Please use option 1."
+            echo "$SERVER_LIST"
+        else
+            echo ""
+            echo "🚨 WARNING 🚨: No servers found. Don't worry ...Please use option 1."
+            echo ""
+        fi
+        echo ""
+        echo ""
+        read -p "Enter your choice: " choice
+        echo ""
+        case $choice in
+        1) get_server_list ;;
+        2) prompt_for_change_request ;;
+        # --- CR NUMBER ENFORCEMENT STARTS HERE ---
+        3|4|5|6) 
+            if [[ -z "$CR_NUMBER" ]]; then
+                log_message "❌ ABORTED: Operation $choice requested, but CR Number is missing."
+                echo "🚨 MANDATORY: You must enter a Change Request (CR) number using Option 2 before proceeding with any operation."
+            else
+                # If CR_NUMBER is set, proceed to the secondary case block for the actual operation
+                case $choice in
+                    3) 
+                        for server in $SERVER_LIST; do run_cluster_command "$server" "pcs status" "pcs status"; done 
+                        ;;
+                    4) 
+                        read -p "Enter the name of the resource to move: " resource_name
+                        read -p "Enter the destination node name: " node_name
+                        for server in $SERVER_LIST; do run_cluster_command "$server" "pcs resource move" "pcs resource move $resource_name $node_name"; done
+                        ;;
+                    5) 
+                        read -p "Enter the name of the resource to cleanup: " resource_name
+                        for server in $SERVER_LIST; do run_cluster_command "$server" "pcs resource cleanup" "pcs resource cleanup $resource_name"; done
+                        ;;
+                    6) 
+                        read -p "Enter the name of the resource to clear constraints: " resource_name
+                        for server in $SERVER_LIST; do run_cluster_command "$server" "pcs resource clear" "pcs resource clear $resource_name"; done
+                        ;;
+                esac
+            fi
+            ;;
+        7) log_message "Going back to Previous Menu... please wait✋." return ;;
+        8 ) log_message "Going back to Main Menu... please wait✋." return 2 ;;
+        9 ) log_message "Exiting script. Have a Great Day !!! Goodbye! 👋😀" exit 0 ;;
+        *) echo "Oops Invalid option selected ❌. Please enter a number from 1 to 9." ;;
+        esac
+        echo 
+        read -p "Press Enter to continue..."
+    done
+}
+
+# Main patching menu
+patching_menu() {
+    while true; do
+        clear
+        echo "========================================"
+        echo " Preparing Menu ....Please wait ✋...."
+        echo "========================================="
+        sleep 2
+        clear
+        echo "====================================================="
+        echo " Welcome to Server Patch Management Menu 😀..."
+        echo "====================================================="
+        echo "-----------------------------------------------------"
+        echo " 1.➡️ Enter Server List"
+        echo " 2.➡️ Enter CR Number"
+        echo " 3.➡️ Check Connectivity"
+        echo " 4.➡️ Check Filesystem Utilization"
+        echo " 5.➡️ Run Patching Pre-checks"
+        echo " 6.➡️ Update Repositories"
+        echo " 7.➡️ Check Updates"
+        echo " 8.➡️ RHEL Patching"
+        echo " 9.➡️ SUSE Patching"
+        echo "10.➡️ Ubuntu Patching"
+        echo "11.➡️ Check Patching Status (Logs)"
+        echo "12.➡️ Run Patching Post-checks"
+        echo "13.➡️ Compare Patching Pre-checks and Post-checks"
+        echo "14.➡️ Mount Missing Filesystems (Post-Reboot)"
+        echo "15.➡️ Run Ad-hoc Command"
+        echo "16.➡️ Reboot"
+        echo "17.➡️ Return to Previous Menu"
+        echo "18.➡️ Return to Main Menu"
+        echo "19.➡️ Exit"
+        echo "-----------------------------------------------------"
+        echo ""
+        echo ""
+        if [ -n "$SERVER_LIST" ]; then
+            echo "Please validate the below provided servers: if not sure, Please use option 1."
+            echo "$SERVER_LIST"
+        else
+            echo ""
+            echo "🚨 WARNING 🚨: No servers found. Don't worry ...Please use option 1."
+            echo ""
+        fi
+        echo ""
+        echo ""
+        read -p "Enter your choice: " choice
+        echo ""
+        echo ""
+        case $choice in
+        1) get_server_list ;;
+        2) prompt_for_change_request ;;
+        # --- CR NUMBER ENFORCEMENT STARTS HERE ---
+        3|4|5|6|7|8|9|10|11|12|13|14|15|16) 
+            if [[ -z "$CR_NUMBER" ]]; then
+                log_message "❌ ABORTED: Operation $choice requested, but CR Number is missing."
+                echo "🚨 MANDATORY: You must enter a Change Request (CR) number using Option 2 before proceeding with any operation."
+            else
+                # If CR_NUMBER is set, proceed to the secondary case block for the actual operation
+                case $choice in
+                    3) check_uptime ;;
+                    4) check_filesystem_utilization ;;
+                    5) run_checks "$PRECHECK_FILE" "Pre-Patching Checks"; send_email "Patching Pre_Checks_completed" "yes" ;;
+                    6) update_repos_by_os ;;
+                    7) check_updates_by_os ;;
+                    8) patch_servers "RHEL" "yum update -y" ;;
+                    9) patch_servers "SUSE" "zypper update -y" ;;
+                    10) patch_servers "UBUNTU" "apt update -y && apt upgrade -y" ;;
+                    11) check_patching_status ;;
+                    12) run_checks "$POSTCHECK_FILE" "Post-Patching Checks"; send_email "Patching Post_Checks_completed" "yes" ;;
+                    13) compare_reports; send_email "Pre & Post Patching Comparison Report" "yes" ;;
+                    14) mount_missing_filesystems ;;
+                    15) run_adhoc_command ;;
+                    16) reboot_servers ;;
+                esac
+            fi
+            ;;
+        17) log_message "Going back to Previous Menu... please wait✋." return ;;
+        18) log_message "Going back to Main Menu... please wait✋." return 1 ;; # Return 1 or just return, depending on calling function.
+        19) log_message "Exiting script. Have a Great Day !!! Goodbye! 👋😀" exit 0 ;;
+        *) echo "Oops Invalid option selected ❌. Please enter a number from 1 to 19." ;;
+        esac
+        echo 
+        read -p "Press Enter to continue..."
+    done
+}
+
+# Function to get user input with a default value
+get_input_with_default() {
+    local prompt="$1"
+    local default_value="$2"
+    read -p "$prompt [$default_value]: " user_input
+    if [[ -z "$user_input" ]]; then
+        echo "$default_value"
+    else
+        echo "$user_input"
+    fi
+}
+
+# Function to check if vm is actually created or not
+wait_for_vm() {
+    local vm_name=$1
+    local rg_name=$2
+    local start_time=$(date +%s)
+    local provisioning_state=""
+    local elapsed_time
+    local timeout=$POLL_TIMEOUT
+    log_message "Waiting for VM '$vm_name' to be created..."
+    while [[ "$provisioning_state" != "Succeeded" ]]; do
+        elapsed_time=$(( $(date +%s) - start_time ))
+        
+        # Update and display the progress bar
+        show_progress "$elapsed_time" "$elapsed_time" "$timeout" 
+        
+        if (( elapsed_time > timeout )); then
+            printf "\n"
+            log_message "❌ Timed out waiting for VM creation (Max time: ${timeout}s). Check the Azure portal for status."
+            return 1
+        fi
+        
+        # Check VM status using Azure CLI (az command)
+        provisioning_state=$(az vm show \
+            --resource-group "$rg_name" \
+            --name "$vm_name" \
+            --query "provisioningState" \
+            --output tsv 2>/dev/null) 
+            
+        if [[ -z "$provisioning_state" ]]; then
+            sleep "$POLL_INTERVAL"
+        elif [[ "$provisioning_state" == "Failed" ]]; then
+            printf "\n"
+            log_message "❌ VM creation failed. Check logs for details."
+            return 1
+        elif [[ "$provisioning_state" == "Succeeded" ]]; then
+            local final_time=$(( $(date +%s) - start_time ))
+            show_progress "$final_time" "$final_time" "$final_time" # Show final 100% status with actual time
+            printf "\n"
+            log_message "✅ VM '$vm_name' created successfully in $final_time seconds."
+            return 0
+        fi
+        
+        sleep "$POLL_INTERVAL"
+    done
+    
+    # Should not be reached if provisioning_state logic is correct, but safe exit
+    return 1 
+}
+
+# Function to show help and workflow (Stub)
+show_help_menu() {
+    clear
+    echo "=========================================="
+    echo "           Help & Workflow Menu"
+    echo "=========================================="
+    echo "This menu would normally display documentation or training material."
+    echo "Current CR Number: ${CR_NUMBER:-N/A}"
+    read -p "Press Enter to return to the Main Menu..."
+}
+
+# Function for Cloud Build Operations (Stub)
+build_menu() {
+    while true; do
+        clear
+        echo "======================================================="
+        echo "           Cloud Build Operations Menu (Stub)"
+        echo "======================================================="
+        echo "---------------------------------------"
+        echo " 1.➡️ Azure VM Deployment (Needs implementation)"
+        echo " 2.➡️ AWS EC2 Deployment (Needs implementation)"
+        echo " 3.➡️ Return to Previous Menu"
+        echo " 4.➡️ Return to Main Menu"
+        echo " 5.➡️ Exit"
+        echo "---------------------------------------"
+        echo "CR Number: ${CR_NUMBER:-N/A}"
+        read -p "Enter your choice: " choice
+        case $choice in
+            1) echo "Azure build logic not yet implemented."; read -p "Press Enter to continue..." ;;
+            2) echo "AWS build logic not yet implemented."; read -p "Press Enter to continue..." ;;
+            3) return ;;
+            4) return 2 ;; # Exit two levels up (back to main)
+            5) log_message "Exiting script. Have a Great Day !!! Goodbye! 👋😀"; exit 0 ;;
+            *) echo "Invalid option." ;;
+        esac
+        echo
+    done
+}
+
+
+# --- MAIN EXECUTION BLOCK ---
+
+# Initial Setup
+initialize_logging
+
+clear
+echo "===================================================================="
+echo " Log Directory is created ....Loading Main menu Please wait ✋...."
+echo "===================================================================="
+sleep 2
+clear
+while true; do
+    clear
+    echo "========================================"
+    echo " Preparing Menu ....Please wait ✋...."
+    echo "========================================="
+    sleep 2
+    clear
+    echo "======================================="
+    echo " Welcome to Automation Main Menu 🙂"
+    echo "======================================="
+    echo "---------------------------------------"
+    echo "1.➡️ Linux Server Patching Operations"
+    echo "2.➡️ SUSE Cluster Server Operations"
+    echo "3.➡️ RHEL Cluster Server Operations"
+    echo "4.➡️ Cloud Build Operations"
+    echo "5.➡️ Help & Workflow"
+	echo "6.➡️ Ask AI (Development Phase)"
+    echo "7.➡️ Exit"
+    echo "---------------------------------------"
+	echo ""
+    read -p "Enter your choice: " choice
+	echo ""
+    case $choice in
+    1) patching_menu ;;
+    2) suse_cluster ;;
+    3) rhel_cluster ;;
+    4) build_menu ;;
+    5) show_help_menu ;;
+	6) echo "option in development phase " 
+        ;;
+            
+    7)
+	    send_email " Automation Execution Completed" "yes"
+        log_message "Exiting script. Have a Great Day !!! Goodbye! 👋😀"
+        exit 0
+        ;;
+    *) echo "Oops Invalid option selected ❌. Please enter a number from 1 to 7." ;;
+    esac
+    echo
+    read -p "Press Enter to return to Main Menu..."
+done
