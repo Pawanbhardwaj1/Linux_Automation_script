@@ -969,4 +969,5 @@ patching_menu() {
 }
 # ================= START SCRIPT =================
 initialize
+
 patching_menu
