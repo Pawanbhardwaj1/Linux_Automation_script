@@ -387,8 +387,8 @@ compare_reports() {
 get_server_list() {
     echo "Enter server hostnames (one per line). Press Ctrl+D when you're done:"
     # This reads all lines from standard input until EOF (Ctrl+D)
- #   SERVER_LIST=$(cat)
-	mapfile -t SERVER_LIST
+    SERVER_LIST=$(cat)
+#	mapfile -t SERVER_LIST
     if [[ ${#SERVER_LIST[@]} -eq 0 ]]; then
  #   if [[ -z "$SERVER_LIST" ]]; then
         log_message "No servers entered."
@@ -972,5 +972,6 @@ patching_menu() {
 initialize
 
 patching_menu
+
 
 
