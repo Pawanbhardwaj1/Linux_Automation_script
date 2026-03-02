@@ -123,6 +123,7 @@ ctrl_c_handler() {
     # check_and_set_remote_lock "cleanup"
 
     log_message "Script terminated by user interrupt. Exiting with status 130."
+#	send_email "Script terminated by user interrupt" "$server" "yes"
     
     # Exit with a status code indicating a fatal error/interruption (128 + signal number)
     exit 130 
@@ -971,4 +972,5 @@ patching_menu() {
 initialize
 
 patching_menu
+
 
